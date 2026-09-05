@@ -24,7 +24,7 @@
   <button id="mic" type="button">🎙 音声入力を開始</button>
   <div id="status">STANDBY</div>
   <div id="transcript" class="transcript"></div>
-  <div class="note">初回のみブラウザのマイク許可を求められる場合があります。許可後はこのページを閉じても構いません。</div>
+  <div class="note">話し終えて約1.5秒無音になると自動送信します。初回のみブラウザのマイク許可を求められる場合があります。</div>
 </main>
 <script>
 (() => {
@@ -32,9 +32,12 @@
   const status = document.getElementById('status');
   const transcript = document.getElementById('transcript');
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const AUTO_SEND_DELAY = 1500;
   let rec = null;
   let active = false;
   let committed = '';
+  let autoSendTimer = null;
+  let submitted = false;
 
   const send = (type, payload={}) => {
     if (window.opener && !window.opener.closed) {
@@ -49,7 +52,36 @@
     status.textContent = text;
   };
 
+  const clearAutoSend = () => {
+    if (autoSendTimer) {
+      clearTimeout(autoSendTimer);
+      autoSendTimer = null;
+    }
+  };
+
+  const submitTranscript = () => {
+    clearAutoSend();
+    if (submitted) return;
+    const text = String(committed || transcript.textContent || '').trim();
+    if (!text) return;
+    submitted = true;
+    paint(false,'KIMI OSへ送信しました');
+    send('submit',{text});
+    const current = rec;
+    rec = null;
+    try { if (current) current.stop(); } catch(e) {}
+    setTimeout(() => window.close(), 260);
+  };
+
+  const scheduleAutoSend = () => {
+    clearAutoSend();
+    if (!committed.trim() || submitted) return;
+    status.textContent = '入力確定。まもなく自動送信...';
+    autoSendTimer = setTimeout(submitTranscript, AUTO_SEND_DELAY);
+  };
+
   const stop = (reason='STOPPED') => {
+    clearAutoSend();
     const current = rec;
     rec = null;
     paint(false, reason);
@@ -64,7 +96,10 @@
       send('error',{error:'unsupported'});
       return;
     }
+    clearAutoSend();
     committed = '';
+    submitted = false;
+    transcript.textContent = '';
     const local = new SR();
     rec = local;
     local.lang = 'ja-JP';
@@ -78,7 +113,8 @@
     };
 
     local.onresult = e => {
-      if (rec !== local) return;
+      if (rec !== local || submitted) return;
+      clearAutoSend();
       let interim = '';
       for (let i=e.resultIndex;i<e.results.length;i++) {
         const part = e.results[i][0].transcript || '';
@@ -88,9 +124,12 @@
       const text = (committed + ' ' + interim).trim();
       transcript.textContent = text;
       send('transcript',{text,final:!interim});
+      if (!interim && committed) scheduleAutoSend();
+      else status.textContent = 'LISTENING...';
     };
 
     local.onerror = e => {
+      clearAutoSend();
       const code = e && e.error ? e.error : 'unknown';
       paint(false,'ERROR: ' + code);
       rec = null;
@@ -98,10 +137,15 @@
     };
 
     local.onend = () => {
+      if (submitted) return;
       if (rec !== local) return;
       rec = null;
-      paint(false,'STOPPED');
-      send('status',{active:false,status:'STOPPED'});
+      if (committed.trim()) {
+        scheduleAutoSend();
+      } else {
+        paint(false,'STOPPED');
+        send('status',{active:false,status:'STOPPED'});
+      }
     };
 
     try {
@@ -114,8 +158,18 @@
     }
   };
 
-  mic.addEventListener('click', () => active ? stop() : start());
-  window.addEventListener('beforeunload', () => send('status',{active:false,status:'CLOSED'}));
+  mic.addEventListener('click', () => {
+    if (active) {
+      if (committed.trim()) submitTranscript();
+      else stop();
+    } else {
+      start();
+    }
+  });
+  window.addEventListener('beforeunload', () => {
+    clearAutoSend();
+    if (!submitted) send('status',{active:false,status:'CLOSED'});
+  });
   send('ready');
 })();
 </script>
