@@ -13,7 +13,7 @@
     h1{margin:0 0 8px;font-size:22px;letter-spacing:.12em}.sub{margin:0 0 20px;color:#76bddc;font-size:12px;line-height:1.7}
     .mic-orb{width:92px;height:92px;margin:8px auto 16px;border-radius:50%;display:grid;place-items:center;border:1px solid #52d8ff;background:#07324d;font-size:36px;box-shadow:0 0 28px rgba(72,216,255,.18);transition:.2s}
     .mic-orb.active{background:#075b81;box-shadow:0 0 18px rgba(72,216,255,.55),0 0 52px rgba(72,216,255,.22);animation:pulse 1.25s ease-in-out infinite}
-    .mic-orb.paused{opacity:.55;animation:none}
+    .mic-orb.speaking{background:#0a4966;box-shadow:0 0 24px rgba(72,216,255,.72),0 0 64px rgba(72,216,255,.28);animation:pulse .72s ease-in-out infinite}
     @keyframes pulse{50%{transform:scale(1.06)}}
     button{width:100%;height:48px;border:1px solid #52d8ff;background:#06263a;color:#effcff;font-weight:800;letter-spacing:.06em;cursor:pointer}
     #status{margin-top:14px;text-align:center;font-size:12px;color:#8fdfff}.transcript{margin-top:14px;min-height:96px;padding:12px;border:1px solid rgba(72,216,255,.25);background:#01070c;white-space:pre-wrap;line-height:1.65}
@@ -22,29 +22,37 @@
 </head>
 <body>
 <main>
-  <h1>KIMI VOICE BRIDGE</h1>
-  <p class="sub">このウィンドウは音声取得だけを担当します。起動後すぐにマイク待受を開始し、認識文字はリアルタイムでKIMI OSへ返します。</p>
+  <h1>KIMI REALTIME VOICE</h1>
+  <p class="sub">マイクとRealtime音声通話だけを担当する外部ブリッジです。APIキーやKIMI内部データはこのページには保存しません。</p>
   <div id="orb" class="mic-orb active" aria-hidden="true">🎙</div>
   <button id="mic" type="button">⏹ 音声モードを停止</button>
-  <div id="status">マイクを起動しています...</div>
+  <div id="status">Realtime接続を準備しています...</div>
   <div id="transcript" class="transcript"></div>
-  <div class="note">送信操作は不要です。KIMI OS側で発話後の無音を検知すると自動送信します。KIMI応答中はマイクを一時停止し、応答後に自動再開します。</div>
+  <div class="note">SEND操作は不要です。発話終了はRealtime側のSemantic VADが判定し、KIMIの音声応答中でも話しかければ割り込みできます。</div>
 </main>
+<audio id="remoteAudio" autoplay></audio>
 <script>
 (() => {
   const mic = document.getElementById('mic');
   const orb = document.getElementById('orb');
   const status = document.getElementById('status');
   const transcript = document.getElementById('transcript');
+  const remoteAudio = document.getElementById('remoteAudio');
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 
-  let rec = null;
   let desired = true;
-  let paused = false;
-  let active = false;
+  let rec = null;
+  let recGeneration = 0;
+  let recTimer = null;
   let committed = '';
-  let restartTimer = null;
-  let generation = 0;
+  let interim = '';
+  let userSpeechDetected = false;
+  let modelSpeaking = false;
+  let pc = null;
+  let dc = null;
+  let localStream = null;
+  let answerApplied = false;
+  let assistantTranscript = '';
 
   const send = (type, payload={}) => {
     if (window.opener && !window.opener.closed) {
@@ -52,171 +60,267 @@
     }
   };
 
-  const paint = (state, text) => {
-    active = state === 'active';
+  function paint(state, text) {
     orb.classList.toggle('active', state === 'active');
-    orb.classList.toggle('paused', state === 'paused');
-    orb.textContent = state === 'paused' ? '⏸' : (state === 'active' ? '🎙' : '🎤');
+    orb.classList.toggle('speaking', state === 'speaking');
+    orb.textContent = state === 'speaking' ? '◉' : (state === 'active' ? '🎙' : '🎤');
+    status.textContent = text || '';
     mic.textContent = desired ? '⏹ 音声モードを停止' : '🎙 音声モードを再開';
-    status.textContent = text;
-  };
+  }
 
-  const clearRestart = () => {
-    if (restartTimer) {
-      clearTimeout(restartTimer);
-      restartTimer = null;
-    }
-  };
+  function clearRecTimer() {
+    if (recTimer) { clearTimeout(recTimer); recTimer = null; }
+  }
 
-  const stopRecognizer = () => {
-    clearRestart();
+  function stopRecognizer() {
+    clearRecTimer();
     const current = rec;
     rec = null;
-    generation += 1;
-    try { if (current) current.stop(); } catch(e) {}
-  };
+    recGeneration += 1;
+    try { if (current) current.abort(); } catch(e) {}
+  }
 
-  const resetTranscript = () => {
+  function resetTranscript() {
     committed = '';
+    interim = '';
     transcript.textContent = '';
-  };
+  }
 
-  const scheduleRestart = (delay=260) => {
-    clearRestart();
-    if (!desired || paused) return;
-    restartTimer = setTimeout(() => {
-      restartTimer = null;
-      startRecognizer(false);
-    }, delay);
-  };
+  function scheduleRecognizerRestart(delay=280) {
+    clearRecTimer();
+    if (!desired) return;
+    recTimer = setTimeout(() => { recTimer = null; startRecognizer(false); }, delay);
+  }
 
-  const startRecognizer = (reset=false) => {
-    if (!SR) {
-      desired = false;
-      paint('off','このブラウザは音声認識に対応していません');
-      mic.disabled = true;
-      send('error',{error:'unsupported'});
-      return;
-    }
-    if (!desired || paused || rec) return;
+  // Browser SpeechRecognition is used only for on-screen text mirroring.
+  // Realtime itself consumes the microphone audio directly through WebRTC.
+  function startRecognizer(reset=false) {
+    if (!SR || !desired || rec) return;
     if (reset) resetTranscript();
-
-    const localGeneration = ++generation;
+    const gen = ++recGeneration;
     const local = new SR();
     rec = local;
     local.lang = 'ja-JP';
     local.interimResults = true;
     local.continuous = true;
 
-    local.onstart = () => {
-      if (rec !== local || generation !== localGeneration) return;
-      paint('active','LISTENING...');
-      send('status',{active:true,status:'LISTENING',paused:false});
-    };
-
     local.onresult = e => {
-      if (rec !== local || generation !== localGeneration || paused || !desired) return;
-      let interim = '';
+      if (rec !== local || gen !== recGeneration || !desired) return;
+      if (modelSpeaking && !userSpeechDetected) return;
+      let nextInterim = '';
       for (let i=e.resultIndex;i<e.results.length;i++) {
         const part = e.results[i][0].transcript || '';
         if (e.results[i].isFinal) committed = (committed + ' ' + part).trim();
-        else interim += part;
+        else nextInterim += part;
       }
+      interim = nextInterim;
       const text = (committed + ' ' + interim).trim();
       transcript.textContent = text;
       send('transcript',{text,final:!interim});
-      status.textContent = 'LISTENING...';
     };
 
     local.onerror = e => {
-      if (rec !== local || generation !== localGeneration) return;
+      if (rec !== local || gen !== recGeneration) return;
       const code = e && e.error ? e.error : 'unknown';
       rec = null;
       if (code === 'no-speech' || code === 'aborted') {
-        paint(paused ? 'paused' : 'active', paused ? 'KIMI応答中...' : 'LISTENING...');
-        if (!paused && desired) scheduleRestart(320);
+        scheduleRecognizerRestart(320);
         return;
       }
-      desired = false;
-      paint('off','ERROR: ' + code);
-      send('error',{error:code});
+      // Realtime audio may still work even if browser STT fails, so only
+      // report the mirror failure without killing the WebRTC call.
+      send('stt-warning',{error:code});
     };
 
     local.onend = () => {
-      if (rec !== local || generation !== localGeneration) return;
+      if (rec !== local || gen !== recGeneration) return;
       rec = null;
-      if (paused) {
-        paint('paused','KIMI応答中...');
-        send('status',{active:false,status:'PAUSED',paused:true});
-      } else if (desired) {
-        paint('active','LISTENING...');
-        scheduleRestart(260);
-      } else {
-        paint('off','STOPPED');
-        send('status',{active:false,status:'STOPPED',paused:false});
-      }
+      scheduleRecognizerRestart(280);
     };
 
-    try {
-      paint(paused ? 'paused' : 'active', paused ? 'KIMI応答中...' : 'マイクを起動しています...');
-      local.start();
-    } catch(e) {
-      rec = null;
-      if (desired && !paused) scheduleRestart(400);
-      else paint('off','START FAILED');
+    try { local.start(); }
+    catch(e) { rec = null; scheduleRecognizerRestart(420); }
+  }
+
+  function waitForIceGathering(connection) {
+    if (connection.iceGatheringState === 'complete') return Promise.resolve();
+    return new Promise(resolve => {
+      const done = () => {
+        if (connection.iceGatheringState === 'complete') {
+          connection.removeEventListener('icegatheringstatechange', done);
+          resolve();
+        }
+      };
+      connection.addEventListener('icegatheringstatechange', done);
+      setTimeout(() => {
+        connection.removeEventListener('icegatheringstatechange', done);
+        resolve();
+      }, 1800);
+    });
+  }
+
+  function handleRealtimeEvent(event) {
+    const type = String(event && event.type || '');
+    if (!type) return;
+
+    if (type === 'input_audio_buffer.speech_started') {
+      userSpeechDetected = true;
+      committed = '';
+      interim = '';
+      transcript.textContent = '';
+      paint('active', modelSpeaking ? '割り込みを聞いています...' : 'LISTENING...');
+      send('status',{active:true,status:'LISTENING',realtime:true});
+      return;
     }
-  };
 
-  const pauseForKimi = () => {
-    if (!desired) return;
-    paused = true;
-    stopRecognizer();
-    paint('paused','KIMI応答中...');
-    send('status',{active:false,status:'PAUSED',paused:true});
-  };
+    if (type === 'input_audio_buffer.speech_stopped') {
+      setTimeout(() => {
+        const text = (committed + ' ' + interim).trim();
+        if (text) send('user-turn-final',{text});
+      }, 260);
+      return;
+    }
 
-  const resumeListening = () => {
-    if (!desired) return;
-    paused = false;
-    resetTranscript();
-    paint('active','マイクを再開しています...');
-    startRecognizer(false);
-  };
+    if (type === 'response.created') {
+      modelSpeaking = true;
+      userSpeechDetected = false;
+      assistantTranscript = '';
+      paint('speaking','KIMIが話しています...');
+      send('status',{active:true,status:'SPEAKING',realtime:true});
+      return;
+    }
 
-  const stopMode = () => {
+    if (type === 'response.output_audio_transcript.delta') {
+      assistantTranscript += String(event.delta || '');
+      return;
+    }
+
+    if (type === 'response.output_audio_transcript.done') {
+      const text = String(event.transcript || assistantTranscript || '').trim();
+      assistantTranscript = text;
+      if (text) send('assistant-transcript',{text});
+      return;
+    }
+
+    if (type === 'response.done') {
+      modelSpeaking = false;
+      userSpeechDetected = false;
+      assistantTranscript = '';
+      paint('active','LISTENING...');
+      send('status',{active:true,status:'LISTENING',realtime:true});
+      return;
+    }
+
+    if (type === 'error') {
+      const err = event.error || {};
+      send('error',{error:String(err.code || err.type || err.message || 'realtime_error')});
+    }
+  }
+
+  async function startRealtime() {
+    try {
+      paint('off','マイクを起動しています...');
+      localStream = await navigator.mediaDevices.getUserMedia({
+        audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true},
+        video:false
+      });
+
+      if (!desired) return;
+      pc = new RTCPeerConnection();
+      pc.ontrack = e => {
+        const stream = e.streams && e.streams[0];
+        if (stream) {
+          remoteAudio.srcObject = stream;
+          remoteAudio.play().catch(() => {});
+        }
+      };
+      pc.onconnectionstatechange = () => {
+        if (!pc) return;
+        const state = pc.connectionState;
+        send('rtc-state',{state});
+        if (state === 'connected') {
+          paint('active','LISTENING...');
+          send('status',{active:true,status:'LISTENING',realtime:true});
+        }
+        if (state === 'failed' || state === 'disconnected') {
+          send('error',{error:'webrtc_' + state});
+        }
+      };
+
+      localStream.getAudioTracks().forEach(track => pc.addTrack(track, localStream));
+      dc = pc.createDataChannel('oai-events');
+      dc.onopen = () => {
+        paint('active','LISTENING...');
+        send('status',{active:true,status:'LISTENING',realtime:true});
+      };
+      dc.onmessage = e => {
+        try { handleRealtimeEvent(JSON.parse(e.data)); } catch(ignore) {}
+      };
+      dc.onerror = () => send('error',{error:'realtime_datachannel'});
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await waitForIceGathering(pc);
+      const sdp = pc.localDescription && pc.localDescription.sdp;
+      if (!sdp) throw new Error('sdp_offer_missing');
+      paint('off','KIMI Realtimeへ接続しています...');
+      send('realtime-offer',{sdp});
+      startRecognizer(true);
+    } catch(e) {
+      send('error',{error:String(e && e.message ? e.message : e || 'realtime_start_failed')});
+      paint('off','ERROR: ' + String(e && e.message ? e.message : e));
+    }
+  }
+
+  async function applyRealtimeAnswer(sdp) {
+    try {
+      if (!pc || answerApplied) return;
+      answerApplied = true;
+      await pc.setRemoteDescription({type:'answer',sdp:String(sdp || '')});
+      paint('active','Realtime接続中...');
+    } catch(e) {
+      send('error',{error:'remote_sdp_' + String(e && e.message ? e.message : 'failed')});
+    }
+  }
+
+  function stopMode(notify=true) {
     desired = false;
-    paused = false;
     stopRecognizer();
+    try { if (dc) dc.close(); } catch(e) {}
+    dc = null;
+    try { if (pc) pc.close(); } catch(e) {}
+    pc = null;
+    if (localStream) {
+      localStream.getTracks().forEach(t => { try { t.stop(); } catch(e) {} });
+      localStream = null;
+    }
+    try { remoteAudio.pause(); remoteAudio.srcObject = null; } catch(e) {}
     paint('off','STOPPED');
-    send('status',{active:false,status:'STOPPED',paused:false});
-  };
+    if (notify) send('status',{active:false,status:'STOPPED',realtime:true});
+  }
 
-  const startMode = () => {
-    desired = true;
-    paused = false;
-    resetTranscript();
-    paint('active','マイクを起動しています...');
-    startRecognizer(false);
-  };
-
-  mic.addEventListener('click', () => desired ? stopMode() : startMode());
+  mic.addEventListener('click', () => {
+    if (desired) {
+      stopMode(true);
+    } else {
+      desired = true;
+      answerApplied = false;
+      resetTranscript();
+      startRealtime();
+    }
+  });
 
   window.addEventListener('message', e => {
     const data = e.data || {};
     if (data.source !== 'KIMI_OS') return;
-    if (data.type === 'pause') pauseForKimi();
-    if (data.type === 'resume') resumeListening();
-    if (data.type === 'stop') stopMode();
+    if (data.type === 'realtime-answer') applyRealtimeAnswer(data.sdp);
+    if (data.type === 'stop') stopMode(true);
   });
 
-  window.addEventListener('beforeunload', () => {
-    clearRestart();
-    send('status',{active:false,status:'CLOSED',paused:false});
-  });
+  window.addEventListener('beforeunload', () => stopMode(false));
 
-  send('ready',{autostart:true});
-  paint('active','マイクを起動しています...');
-  setTimeout(() => startRecognizer(true), 80);
+  send('ready',{autostart:true,realtime:true});
+  setTimeout(startRealtime, 60);
 })();
 </script>
 </body>
