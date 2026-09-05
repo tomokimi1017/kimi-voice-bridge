@@ -11,33 +11,40 @@
     body{margin:0;min-height:100vh;display:grid;place-items:center;background:#020811;color:#dff8ff}
     main{width:min(560px,92vw);padding:28px;border:1px solid #168ac1;background:linear-gradient(180deg,#061727,#020a12);box-shadow:0 0 48px rgba(0,180,255,.14)}
     h1{margin:0 0 8px;font-size:22px;letter-spacing:.12em}.sub{margin:0 0 20px;color:#76bddc;font-size:12px;line-height:1.7}
-    button{width:100%;height:56px;border:1px solid #52d8ff;background:#07324d;color:#effcff;font-weight:800;letter-spacing:.06em;cursor:pointer}
-    button.active{background:#075b81;box-shadow:0 0 24px rgba(72,216,255,.28)}
-    #status{margin-top:14px;font-size:12px;color:#8fdfff}.transcript{margin-top:14px;min-height:96px;padding:12px;border:1px solid rgba(72,216,255,.25);background:#01070c;white-space:pre-wrap;line-height:1.65}
+    .mic-orb{width:92px;height:92px;margin:8px auto 16px;border-radius:50%;display:grid;place-items:center;border:1px solid #52d8ff;background:#07324d;font-size:36px;box-shadow:0 0 28px rgba(72,216,255,.18);transition:.2s}
+    .mic-orb.active{background:#075b81;box-shadow:0 0 18px rgba(72,216,255,.55),0 0 52px rgba(72,216,255,.22);animation:pulse 1.25s ease-in-out infinite}
+    .mic-orb.paused{opacity:.55;animation:none}
+    @keyframes pulse{50%{transform:scale(1.06)}}
+    button{width:100%;height:48px;border:1px solid #52d8ff;background:#06263a;color:#effcff;font-weight:800;letter-spacing:.06em;cursor:pointer}
+    #status{margin-top:14px;text-align:center;font-size:12px;color:#8fdfff}.transcript{margin-top:14px;min-height:96px;padding:12px;border:1px solid rgba(72,216,255,.25);background:#01070c;white-space:pre-wrap;line-height:1.65}
     .note{margin-top:14px;color:#587f94;font-size:11px;line-height:1.6}
   </style>
 </head>
 <body>
 <main>
   <h1>KIMI VOICE BRIDGE</h1>
-  <p class="sub">このページはマイク入力だけを担当します。音声は保存せず、ブラウザの音声認識結果だけを元のKIMI OSへ返します。</p>
-  <button id="mic" type="button">🎙 音声入力を開始</button>
-  <div id="status">STANDBY</div>
+  <p class="sub">このウィンドウは音声取得だけを担当します。起動後すぐにマイク待受を開始し、認識文字はリアルタイムでKIMI OSへ返します。</p>
+  <div id="orb" class="mic-orb active" aria-hidden="true">🎙</div>
+  <button id="mic" type="button">⏹ 音声モードを停止</button>
+  <div id="status">マイクを起動しています...</div>
   <div id="transcript" class="transcript"></div>
-  <div class="note">話し終えて約1.5秒無音になると自動送信します。初回のみブラウザのマイク許可を求められる場合があります。</div>
+  <div class="note">送信操作は不要です。KIMI OS側で発話後の無音を検知すると自動送信します。KIMI応答中はマイクを一時停止し、応答後に自動再開します。</div>
 </main>
 <script>
 (() => {
   const mic = document.getElementById('mic');
+  const orb = document.getElementById('orb');
   const status = document.getElementById('status');
   const transcript = document.getElementById('transcript');
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  const AUTO_SEND_DELAY = 1500;
+
   let rec = null;
+  let desired = true;
+  let paused = false;
   let active = false;
   let committed = '';
-  let autoSendTimer = null;
-  let submitted = false;
+  let restartTimer = null;
+  let generation = 0;
 
   const send = (type, payload={}) => {
     if (window.opener && !window.opener.closed) {
@@ -45,61 +52,56 @@
     }
   };
 
-  const paint = (on, text) => {
-    active = on;
-    mic.classList.toggle('active', on);
-    mic.textContent = on ? '⏹ 音声入力を停止' : '🎙 音声入力を開始';
+  const paint = (state, text) => {
+    active = state === 'active';
+    orb.classList.toggle('active', state === 'active');
+    orb.classList.toggle('paused', state === 'paused');
+    orb.textContent = state === 'paused' ? '⏸' : (state === 'active' ? '🎙' : '🎤');
+    mic.textContent = desired ? '⏹ 音声モードを停止' : '🎙 音声モードを再開';
     status.textContent = text;
   };
 
-  const clearAutoSend = () => {
-    if (autoSendTimer) {
-      clearTimeout(autoSendTimer);
-      autoSendTimer = null;
+  const clearRestart = () => {
+    if (restartTimer) {
+      clearTimeout(restartTimer);
+      restartTimer = null;
     }
   };
 
-  const submitTranscript = () => {
-    clearAutoSend();
-    if (submitted) return;
-    const text = String(committed || transcript.textContent || '').trim();
-    if (!text) return;
-    submitted = true;
-    paint(false,'KIMI OSへ送信しました');
-    send('submit',{text});
+  const stopRecognizer = () => {
+    clearRestart();
     const current = rec;
     rec = null;
+    generation += 1;
     try { if (current) current.stop(); } catch(e) {}
-    setTimeout(() => window.close(), 260);
   };
 
-  const scheduleAutoSend = () => {
-    clearAutoSend();
-    if (!committed.trim() || submitted) return;
-    status.textContent = '入力確定。まもなく自動送信...';
-    autoSendTimer = setTimeout(submitTranscript, AUTO_SEND_DELAY);
+  const resetTranscript = () => {
+    committed = '';
+    transcript.textContent = '';
   };
 
-  const stop = (reason='STOPPED') => {
-    clearAutoSend();
-    const current = rec;
-    rec = null;
-    paint(false, reason);
-    try { if (current) current.stop(); } catch(e) {}
-    send('status',{active:false,status:reason});
+  const scheduleRestart = (delay=260) => {
+    clearRestart();
+    if (!desired || paused) return;
+    restartTimer = setTimeout(() => {
+      restartTimer = null;
+      startRecognizer(false);
+    }, delay);
   };
 
-  const start = () => {
+  const startRecognizer = (reset=false) => {
     if (!SR) {
-      paint(false,'このブラウザは音声認識に対応していません');
+      desired = false;
+      paint('off','このブラウザは音声認識に対応していません');
       mic.disabled = true;
       send('error',{error:'unsupported'});
       return;
     }
-    clearAutoSend();
-    committed = '';
-    submitted = false;
-    transcript.textContent = '';
+    if (!desired || paused || rec) return;
+    if (reset) resetTranscript();
+
+    const localGeneration = ++generation;
     const local = new SR();
     rec = local;
     local.lang = 'ja-JP';
@@ -107,14 +109,13 @@
     local.continuous = true;
 
     local.onstart = () => {
-      if (rec !== local) return;
-      paint(true,'LISTENING...');
-      send('status',{active:true,status:'LISTENING'});
+      if (rec !== local || generation !== localGeneration) return;
+      paint('active','LISTENING...');
+      send('status',{active:true,status:'LISTENING',paused:false});
     };
 
     local.onresult = e => {
-      if (rec !== local || submitted) return;
-      clearAutoSend();
+      if (rec !== local || generation !== localGeneration || paused || !desired) return;
       let interim = '';
       for (let i=e.resultIndex;i<e.results.length;i++) {
         const part = e.results[i][0].transcript || '';
@@ -124,53 +125,98 @@
       const text = (committed + ' ' + interim).trim();
       transcript.textContent = text;
       send('transcript',{text,final:!interim});
-      if (!interim && committed) scheduleAutoSend();
-      else status.textContent = 'LISTENING...';
+      status.textContent = 'LISTENING...';
     };
 
     local.onerror = e => {
-      clearAutoSend();
+      if (rec !== local || generation !== localGeneration) return;
       const code = e && e.error ? e.error : 'unknown';
-      paint(false,'ERROR: ' + code);
       rec = null;
+      if (code === 'no-speech' || code === 'aborted') {
+        paint(paused ? 'paused' : 'active', paused ? 'KIMI応答中...' : 'LISTENING...');
+        if (!paused && desired) scheduleRestart(320);
+        return;
+      }
+      desired = false;
+      paint('off','ERROR: ' + code);
       send('error',{error:code});
     };
 
     local.onend = () => {
-      if (submitted) return;
-      if (rec !== local) return;
+      if (rec !== local || generation !== localGeneration) return;
       rec = null;
-      if (committed.trim()) {
-        scheduleAutoSend();
+      if (paused) {
+        paint('paused','KIMI応答中...');
+        send('status',{active:false,status:'PAUSED',paused:true});
+      } else if (desired) {
+        paint('active','LISTENING...');
+        scheduleRestart(260);
       } else {
-        paint(false,'STOPPED');
-        send('status',{active:false,status:'STOPPED'});
+        paint('off','STOPPED');
+        send('status',{active:false,status:'STOPPED',paused:false});
       }
     };
 
     try {
-      paint(true,'マイクを起動しています...');
+      paint(paused ? 'paused' : 'active', paused ? 'KIMI応答中...' : 'マイクを起動しています...');
       local.start();
     } catch(e) {
       rec = null;
-      paint(false,'START FAILED');
-      send('error',{error:'start-failed'});
+      if (desired && !paused) scheduleRestart(400);
+      else paint('off','START FAILED');
     }
   };
 
-  mic.addEventListener('click', () => {
-    if (active) {
-      if (committed.trim()) submitTranscript();
-      else stop();
-    } else {
-      start();
-    }
+  const pauseForKimi = () => {
+    if (!desired) return;
+    paused = true;
+    stopRecognizer();
+    paint('paused','KIMI応答中...');
+    send('status',{active:false,status:'PAUSED',paused:true});
+  };
+
+  const resumeListening = () => {
+    if (!desired) return;
+    paused = false;
+    resetTranscript();
+    paint('active','マイクを再開しています...');
+    startRecognizer(false);
+  };
+
+  const stopMode = () => {
+    desired = false;
+    paused = false;
+    stopRecognizer();
+    paint('off','STOPPED');
+    send('status',{active:false,status:'STOPPED',paused:false});
+  };
+
+  const startMode = () => {
+    desired = true;
+    paused = false;
+    resetTranscript();
+    paint('active','マイクを起動しています...');
+    startRecognizer(false);
+  };
+
+  mic.addEventListener('click', () => desired ? stopMode() : startMode());
+
+  window.addEventListener('message', e => {
+    const data = e.data || {};
+    if (data.source !== 'KIMI_OS') return;
+    if (data.type === 'pause') pauseForKimi();
+    if (data.type === 'resume') resumeListening();
+    if (data.type === 'stop') stopMode();
   });
+
   window.addEventListener('beforeunload', () => {
-    clearAutoSend();
-    if (!submitted) send('status',{active:false,status:'CLOSED'});
+    clearRestart();
+    send('status',{active:false,status:'CLOSED',paused:false});
   });
-  send('ready');
+
+  send('ready',{autostart:true});
+  paint('active','マイクを起動しています...');
+  setTimeout(() => startRecognizer(true), 80);
 })();
 </script>
 </body>
