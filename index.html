@@ -53,6 +53,8 @@
   let localStream = null;
   let answerApplied = false;
   let assistantTranscript = '';
+  let assistantTranscriptSent = false;
+  let currentResponseId = '';
 
   const send = (type, payload={}) => {
     if (window.opener && !window.opener.closed) {
@@ -92,6 +94,26 @@
     recTimer = setTimeout(() => { recTimer = null; startRecognizer(false); }, delay);
   }
 
+  function extractAssistantTranscript(event) {
+    const response = event && event.response;
+    const chunks = [];
+    ((response && response.output) || []).forEach(item => {
+      (item.content || []).forEach(part => {
+        if (part && typeof part.transcript === 'string' && part.transcript) chunks.push(part.transcript);
+        else if (part && typeof part.text === 'string' && part.text) chunks.push(part.text);
+      });
+    });
+    return chunks.join('').trim();
+  }
+
+  function emitAssistantTranscript(candidate='') {
+    const text = String(candidate || assistantTranscript || '').trim();
+    if (!text || assistantTranscriptSent) return;
+    assistantTranscript = text;
+    assistantTranscriptSent = true;
+    send('assistant-transcript',{text,responseId:currentResponseId});
+  }
+
   // Browser SpeechRecognition is used only for on-screen text mirroring.
   // Realtime itself consumes the microphone audio directly through WebRTC.
   function startRecognizer(reset=false) {
@@ -127,8 +149,6 @@
         scheduleRecognizerRestart(320);
         return;
       }
-      // Realtime audio may still work even if browser STT fails, so only
-      // report the mirror failure without killing the WebRTC call.
       send('stt-warning',{error:code});
     };
 
@@ -185,6 +205,8 @@
       modelSpeaking = true;
       userSpeechDetected = false;
       assistantTranscript = '';
+      assistantTranscriptSent = false;
+      currentResponseId = String(event && event.response && event.response.id || '');
       paint('speaking','KIMIが話しています...');
       send('status',{active:true,status:'SPEAKING',realtime:true});
       return;
@@ -196,16 +218,37 @@
     }
 
     if (type === 'response.output_audio_transcript.done') {
-      const text = String(event.transcript || assistantTranscript || '').trim();
-      assistantTranscript = text;
-      if (text) send('assistant-transcript',{text});
+      emitAssistantTranscript(event.transcript || assistantTranscript);
+      return;
+    }
+
+    if (type === 'response.content_part.done') {
+      const part = event.part || {};
+      if (typeof part.transcript === 'string' && part.transcript) assistantTranscript = part.transcript;
+      else if (typeof part.text === 'string' && part.text) assistantTranscript = part.text;
+      return;
+    }
+
+    if (type === 'response.output_item.done') {
+      const item = event.item || {};
+      (item.content || []).forEach(part => {
+        if (part && typeof part.transcript === 'string' && part.transcript) assistantTranscript = part.transcript;
+        else if (part && typeof part.text === 'string' && part.text) assistantTranscript = part.text;
+      });
       return;
     }
 
     if (type === 'response.done') {
+      // Audio output always has a transcript. Some interrupted/fast responses can
+      // reach response.done without the dedicated transcript.done handler being
+      // observed by the bridge, so flush the accumulated/final response transcript
+      // here before clearing per-response state.
+      emitAssistantTranscript(extractAssistantTranscript(event));
       modelSpeaking = false;
       userSpeechDetected = false;
       assistantTranscript = '';
+      assistantTranscriptSent = false;
+      currentResponseId = '';
       paint('active','LISTENING...');
       send('status',{active:true,status:'LISTENING',realtime:true});
       return;
@@ -295,8 +338,21 @@
       localStream = null;
     }
     try { remoteAudio.pause(); remoteAudio.srcObject = null; } catch(e) {}
+    modelSpeaking = false;
+    assistantTranscript = '';
+    assistantTranscriptSent = false;
+    currentResponseId = '';
     paint('off','STOPPED');
     if (notify) send('status',{active:false,status:'STOPPED',realtime:true});
+  }
+
+  function restartMode() {
+    stopMode(false);
+    desired = true;
+    answerApplied = false;
+    resetTranscript();
+    paint('off','担当コンテキストを切り替えています...');
+    setTimeout(startRealtime, 90);
   }
 
   mic.addEventListener('click', () => {
@@ -314,6 +370,7 @@
     const data = e.data || {};
     if (data.source !== 'KIMI_OS') return;
     if (data.type === 'realtime-answer') applyRealtimeAnswer(data.sdp);
+    if (data.type === 'restart') restartMode();
     if (data.type === 'stop') stopMode(true);
   });
 
