@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>KIMI Voice Bridge</title>
+  <style>
+    :root{color-scheme:dark;font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif}
+    *{box-sizing:border-box}
+    body{margin:0;min-height:100vh;display:grid;place-items:center;background:#020811;color:#dff8ff}
+    main{width:min(560px,92vw);padding:28px;border:1px solid #168ac1;background:linear-gradient(180deg,#061727,#020a12);box-shadow:0 0 48px rgba(0,180,255,.14)}
+    h1{margin:0 0 8px;font-size:22px;letter-spacing:.12em}.sub{margin:0 0 20px;color:#76bddc;font-size:12px;line-height:1.7}
+    button{width:100%;height:56px;border:1px solid #52d8ff;background:#07324d;color:#effcff;font-weight:800;letter-spacing:.06em;cursor:pointer}
+    button.active{background:#075b81;box-shadow:0 0 24px rgba(72,216,255,.28)}
+    #status{margin-top:14px;font-size:12px;color:#8fdfff}.transcript{margin-top:14px;min-height:96px;padding:12px;border:1px solid rgba(72,216,255,.25);background:#01070c;white-space:pre-wrap;line-height:1.65}
+    .note{margin-top:14px;color:#587f94;font-size:11px;line-height:1.6}
+  </style>
+</head>
+<body>
+<main>
+  <h1>KIMI VOICE BRIDGE</h1>
+  <p class="sub">このページはマイク入力だけを担当します。音声は保存せず、ブラウザの音声認識結果だけを元のKIMI OSへ返します。</p>
+  <button id="mic" type="button">🎙 音声入力を開始</button>
+  <div id="status">STANDBY</div>
+  <div id="transcript" class="transcript"></div>
+  <div class="note">初回のみブラウザのマイク許可を求められる場合があります。許可後はこのページを閉じても構いません。</div>
+</main>
+<script>
+(() => {
+  const mic = document.getElementById('mic');
+  const status = document.getElementById('status');
+  const transcript = document.getElementById('transcript');
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  let rec = null;
+  let active = false;
+  let committed = '';
+
+  const send = (type, payload={}) => {
+    if (window.opener && !window.opener.closed) {
+      window.opener.postMessage({source:'KIMI_VOICE_BRIDGE',type,...payload}, '*');
+    }
+  };
+
+  const paint = (on, text) => {
+    active = on;
+    mic.classList.toggle('active', on);
+    mic.textContent = on ? '⏹ 音声入力を停止' : '🎙 音声入力を開始';
+    status.textContent = text;
+  };
+
+  const stop = (reason='STOPPED') => {
+    const current = rec;
+    rec = null;
+    paint(false, reason);
+    try { if (current) current.stop(); } catch(e) {}
+    send('status',{active:false,status:reason});
+  };
+
+  const start = () => {
+    if (!SR) {
+      paint(false,'このブラウザは音声認識に対応していません');
+      mic.disabled = true;
+      send('error',{error:'unsupported'});
+      return;
+    }
+    committed = '';
+    const local = new SR();
+    rec = local;
+    local.lang = 'ja-JP';
+    local.interimResults = true;
+    local.continuous = true;
+
+    local.onstart = () => {
+      if (rec !== local) return;
+      paint(true,'LISTENING...');
+      send('status',{active:true,status:'LISTENING'});
+    };
+
+    local.onresult = e => {
+      if (rec !== local) return;
+      let interim = '';
+      for (let i=e.resultIndex;i<e.results.length;i++) {
+        const part = e.results[i][0].transcript || '';
+        if (e.results[i].isFinal) committed = (committed + ' ' + part).trim();
+        else interim += part;
+      }
+      const text = (committed + ' ' + interim).trim();
+      transcript.textContent = text;
+      send('transcript',{text,final:!interim});
+    };
+
+    local.onerror = e => {
+      const code = e && e.error ? e.error : 'unknown';
+      paint(false,'ERROR: ' + code);
+      rec = null;
+      send('error',{error:code});
+    };
+
+    local.onend = () => {
+      if (rec !== local) return;
+      rec = null;
+      paint(false,'STOPPED');
+      send('status',{active:false,status:'STOPPED'});
+    };
+
+    try {
+      paint(true,'マイクを起動しています...');
+      local.start();
+    } catch(e) {
+      rec = null;
+      paint(false,'START FAILED');
+      send('error',{error:'start-failed'});
+    }
+  };
+
+  mic.addEventListener('click', () => active ? stop() : start());
+  window.addEventListener('beforeunload', () => send('status',{active:false,status:'CLOSED'}));
+  send('ready');
+})();
+</script>
+</body>
+</html>
