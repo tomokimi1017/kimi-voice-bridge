@@ -244,6 +244,10 @@
       // observed by the bridge, so flush the accumulated/final response transcript
       // here before clearing per-response state.
       emitAssistantTranscript(extractAssistantTranscript(event));
+      const responseId = String(event && event.response && event.response.id || currentResponseId || '');
+      if (event && event.response && event.response.usage) {
+        send('realtime-usage',{usage:event.response.usage,responseId});
+      }
       modelSpeaking = false;
       userSpeechDetected = false;
       assistantTranscript = '';
