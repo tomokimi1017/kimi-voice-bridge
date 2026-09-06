@@ -28,7 +28,7 @@
   <button id="mic" type="button">⏹ 音声モードを停止</button>
   <div id="status">Realtime接続を準備しています...</div>
   <div id="transcript" class="transcript"></div>
-  <div class="note">SEND操作は不要です。発話終了はRealtime側のSemantic VADが判定し、KIMIの音声応答中でも話しかければ割り込みできます。</div>
+  <div class="note">SEND操作は不要です。発話終了はRealtime側のSemantic VADが判定します。Cost Guardにより、無音90秒・10応答・推定$0.05のいずれかで音声モードを自動停止します。</div>
 </main>
 <audio id="remoteAudio" autoplay></audio>
 <script>
@@ -39,6 +39,13 @@
   const transcript = document.getElementById('transcript');
   const remoteAudio = document.getElementById('remoteAudio');
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+  const COST_GUARD = Object.freeze({
+    inactivityMs: 90000,
+    minSpeechMs: 180,
+    maxResponses: 10,
+    maxSessionUsd: 0.05
+  });
 
   let desired = true;
   let rec = null;
@@ -55,6 +62,12 @@
   let assistantTranscript = '';
   let assistantTranscriptSent = false;
   let currentResponseId = '';
+  let inactivityTimer = null;
+  let speechStartedAt = 0;
+  let responseArmed = false;
+  let currentResponseAllowed = false;
+  let responseCount = 0;
+  let sessionEstimatedUsd = 0;
 
   const send = (type, payload={}) => {
     if (window.opener && !window.opener.closed) {
@@ -72,6 +85,35 @@
 
   function clearRecTimer() {
     if (recTimer) { clearTimeout(recTimer); recTimer = null; }
+  }
+
+  function clearInactivityTimer() {
+    if (inactivityTimer) { clearTimeout(inactivityTimer); inactivityTimer = null; }
+  }
+
+  function resetCostGuard() {
+    clearInactivityTimer();
+    speechStartedAt = 0;
+    responseArmed = false;
+    currentResponseAllowed = false;
+    responseCount = 0;
+    sessionEstimatedUsd = 0;
+  }
+
+  function armInactivityTimer() {
+    clearInactivityTimer();
+    if (!desired || modelSpeaking) return;
+    inactivityTimer = setTimeout(() => {
+      inactivityTimer = null;
+      send('cost-guard',{
+        action:'auto_stop_inactivity',
+        responses:responseCount,
+        estimatedUsd:sessionEstimatedUsd,
+        limitSeconds:Math.round(COST_GUARD.inactivityMs / 1000)
+      });
+      paint('off','COST GUARD: 無音90秒で自動停止');
+      setTimeout(() => stopMode(true), 80);
+    }, COST_GUARD.inactivityMs);
   }
 
   function stopRecognizer() {
@@ -107,11 +149,98 @@
   }
 
   function emitAssistantTranscript(candidate='') {
+    if (!currentResponseAllowed) return;
     const text = String(candidate || assistantTranscript || '').trim();
     if (!text || assistantTranscriptSent) return;
     assistantTranscript = text;
     assistantTranscriptSent = true;
     send('assistant-transcript',{text,responseId:currentResponseId});
+  }
+
+  function realtimeUsageNumber(value) {
+    const n = Number(value || 0);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  }
+
+  function estimateRealtimeUsd(usage) {
+    const u = usage || {};
+    const inputTokens = realtimeUsageNumber(u.input_tokens || u.inputTokens);
+    const outputTokens = realtimeUsageNumber(u.output_tokens || u.outputTokens);
+    const inDetails = u.input_tokens_details || u.input_token_details || u.inputTokenDetails || {};
+    const outDetails = u.output_tokens_details || u.output_token_details || u.outputTokenDetails || {};
+    const cachedDetails = inDetails.cached_tokens_details || inDetails.cached_token_details || {};
+
+    let textInput = realtimeUsageNumber(inDetails.text_tokens || inDetails.textTokens);
+    let audioInput = realtimeUsageNumber(inDetails.audio_tokens || inDetails.audioTokens);
+    let textOutput = realtimeUsageNumber(outDetails.text_tokens || outDetails.textTokens);
+    let audioOutput = realtimeUsageNumber(outDetails.audio_tokens || outDetails.audioTokens);
+    const cachedInput = realtimeUsageNumber(inDetails.cached_tokens || inDetails.cachedTokens);
+    let cachedText = realtimeUsageNumber(cachedDetails.text_tokens || cachedDetails.textTokens);
+    let cachedAudio = realtimeUsageNumber(cachedDetails.audio_tokens || cachedDetails.audioTokens);
+
+    if (!textInput && inputTokens > audioInput) textInput = inputTokens - audioInput;
+    if (!textOutput && outputTokens > audioOutput) textOutput = outputTokens - audioOutput;
+    if (!textInput && !audioInput && inputTokens) audioInput = inputTokens;
+    if (!textOutput && !audioOutput && outputTokens) audioOutput = outputTokens;
+
+    if (!cachedText && !cachedAudio && cachedInput) {
+      cachedText = Math.min(cachedInput, textInput);
+      cachedAudio = Math.min(Math.max(0, cachedInput - cachedText), audioInput);
+    }
+
+    const uncachedText = Math.max(0, textInput - Math.min(cachedText, textInput));
+    const uncachedAudio = Math.max(0, audioInput - Math.min(cachedAudio, audioInput));
+    return (
+      uncachedText * 4.00 +
+      Math.min(cachedText, textInput) * 0.40 +
+      uncachedAudio * 32.00 +
+      Math.min(cachedAudio, audioInput) * 0.40 +
+      textOutput * 16.00 +
+      audioOutput * 64.00
+    ) / 1000000;
+  }
+
+  function cancelUnarmedResponse(reason) {
+    try {
+      if (dc && dc.readyState === 'open') dc.send(JSON.stringify({type:'response.cancel'}));
+    } catch(e) {}
+    send('cost-guard',{
+      action:'blocked_unarmed_response',
+      reason:String(reason || 'no_valid_user_turn'),
+      responses:responseCount,
+      estimatedUsd:sessionEstimatedUsd
+    });
+  }
+
+  function registerResponseUsage(usage, allowed) {
+    const estimated = estimateRealtimeUsd(usage);
+    sessionEstimatedUsd += estimated;
+    if (allowed) responseCount += 1;
+
+    send('cost-guard',{
+      action:'usage',
+      responses:responseCount,
+      estimatedUsd:sessionEstimatedUsd,
+      responseEstimatedUsd:estimated,
+      maxResponses:COST_GUARD.maxResponses,
+      maxSessionUsd:COST_GUARD.maxSessionUsd
+    });
+
+    if (responseCount >= COST_GUARD.maxResponses || sessionEstimatedUsd >= COST_GUARD.maxSessionUsd) {
+      const reason = responseCount >= COST_GUARD.maxResponses ? 'response_limit' : 'cost_limit';
+      send('cost-guard',{
+        action:'auto_stop_limit',
+        reason,
+        responses:responseCount,
+        estimatedUsd:sessionEstimatedUsd,
+        maxResponses:COST_GUARD.maxResponses,
+        maxSessionUsd:COST_GUARD.maxSessionUsd
+      });
+      paint('off', reason === 'response_limit' ? 'COST GUARD: 10応答で自動停止' : 'COST GUARD: $0.05上限で自動停止');
+      setTimeout(() => stopMode(true), 100);
+      return true;
+    }
+    return false;
   }
 
   // Browser SpeechRecognition is used only for on-screen text mirroring.
@@ -184,6 +313,9 @@
     if (!type) return;
 
     if (type === 'input_audio_buffer.speech_started') {
+      clearInactivityTimer();
+      speechStartedAt = performance.now();
+      responseArmed = false;
       userSpeechDetected = true;
       committed = '';
       interim = '';
@@ -194,6 +326,13 @@
     }
 
     if (type === 'input_audio_buffer.speech_stopped') {
+      const durationMs = speechStartedAt ? Math.max(0, performance.now() - speechStartedAt) : 0;
+      speechStartedAt = 0;
+      responseArmed = durationMs >= COST_GUARD.minSpeechMs;
+      if (!responseArmed) {
+        send('cost-guard',{action:'ignored_short_audio',durationMs:Math.round(durationMs)});
+        armInactivityTimer();
+      }
       setTimeout(() => {
         const text = (committed + ' ' + interim).trim();
         if (text) send('user-turn-final',{text});
@@ -202,18 +341,29 @@
     }
 
     if (type === 'response.created') {
-      modelSpeaking = true;
-      userSpeechDetected = false;
+      currentResponseAllowed = !!responseArmed;
+      responseArmed = false;
       assistantTranscript = '';
       assistantTranscriptSent = false;
       currentResponseId = String(event && event.response && event.response.id || '');
+
+      if (!currentResponseAllowed) {
+        modelSpeaking = false;
+        userSpeechDetected = false;
+        cancelUnarmedResponse('response_without_valid_user_turn');
+        armInactivityTimer();
+        return;
+      }
+
+      modelSpeaking = true;
+      userSpeechDetected = false;
       paint('speaking','KIMIが話しています...');
       send('status',{active:true,status:'SPEAKING',realtime:true});
       return;
     }
 
     if (type === 'response.output_audio_transcript.delta') {
-      assistantTranscript += String(event.delta || '');
+      if (currentResponseAllowed) assistantTranscript += String(event.delta || '');
       return;
     }
 
@@ -223,6 +373,7 @@
     }
 
     if (type === 'response.content_part.done') {
+      if (!currentResponseAllowed) return;
       const part = event.part || {};
       if (typeof part.transcript === 'string' && part.transcript) assistantTranscript = part.transcript;
       else if (typeof part.text === 'string' && part.text) assistantTranscript = part.text;
@@ -230,6 +381,7 @@
     }
 
     if (type === 'response.output_item.done') {
+      if (!currentResponseAllowed) return;
       const item = event.item || {};
       (item.content || []).forEach(part => {
         if (part && typeof part.transcript === 'string' && part.transcript) assistantTranscript = part.transcript;
@@ -239,22 +391,24 @@
     }
 
     if (type === 'response.done') {
-      // Audio output always has a transcript. Some interrupted/fast responses can
-      // reach response.done without the dedicated transcript.done handler being
-      // observed by the bridge, so flush the accumulated/final response transcript
-      // here before clearing per-response state.
-      emitAssistantTranscript(extractAssistantTranscript(event));
+      const allowed = currentResponseAllowed;
+      if (allowed) emitAssistantTranscript(extractAssistantTranscript(event));
       const responseId = String(event && event.response && event.response.id || currentResponseId || '');
-      if (event && event.response && event.response.usage) {
-        send('realtime-usage',{usage:event.response.usage,responseId});
-      }
+      const usage = event && event.response && event.response.usage ? event.response.usage : null;
+      if (usage) send('realtime-usage',{usage,responseId});
+      const stoppedByGuard = usage ? registerResponseUsage(usage, allowed) : false;
+
       modelSpeaking = false;
       userSpeechDetected = false;
+      responseArmed = false;
+      currentResponseAllowed = false;
       assistantTranscript = '';
       assistantTranscriptSent = false;
       currentResponseId = '';
+      if (stoppedByGuard) return;
       paint('active','LISTENING...');
       send('status',{active:true,status:'LISTENING',realtime:true});
+      armInactivityTimer();
       return;
     }
 
@@ -288,6 +442,7 @@
         if (state === 'connected') {
           paint('active','LISTENING...');
           send('status',{active:true,status:'LISTENING',realtime:true});
+          armInactivityTimer();
         }
         if (state === 'failed' || state === 'disconnected') {
           send('error',{error:'webrtc_' + state});
@@ -299,6 +454,7 @@
       dc.onopen = () => {
         paint('active','LISTENING...');
         send('status',{active:true,status:'LISTENING',realtime:true});
+        armInactivityTimer();
       };
       dc.onmessage = e => {
         try { handleRealtimeEvent(JSON.parse(e.data)); } catch(ignore) {}
@@ -325,6 +481,7 @@
       answerApplied = true;
       await pc.setRemoteDescription({type:'answer',sdp:String(sdp || '')});
       paint('active','Realtime接続中...');
+      armInactivityTimer();
     } catch(e) {
       send('error',{error:'remote_sdp_' + String(e && e.message ? e.message : 'failed')});
     }
@@ -332,6 +489,7 @@
 
   function stopMode(notify=true) {
     desired = false;
+    clearInactivityTimer();
     stopRecognizer();
     try { if (dc) dc.close(); } catch(e) {}
     dc = null;
@@ -343,6 +501,10 @@
     }
     try { remoteAudio.pause(); remoteAudio.srcObject = null; } catch(e) {}
     modelSpeaking = false;
+    userSpeechDetected = false;
+    speechStartedAt = 0;
+    responseArmed = false;
+    currentResponseAllowed = false;
     assistantTranscript = '';
     assistantTranscriptSent = false;
     currentResponseId = '';
@@ -366,6 +528,7 @@
       desired = true;
       answerApplied = false;
       resetTranscript();
+      resetCostGuard();
       startRealtime();
     }
   });
@@ -380,6 +543,7 @@
 
   window.addEventListener('beforeunload', () => stopMode(false));
 
+  resetCostGuard();
   send('ready',{autostart:true,realtime:true});
   setTimeout(startRealtime, 60);
 })();
